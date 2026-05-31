@@ -1,0 +1,65 @@
+import { lazy, Suspense } from "react"
+import { Loader2 } from "lucide-react"
+import { BrowserRouter, Routes, Route, Navigate } from "react-router"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import { Toaster } from "@/components/ui/sonner"
+import { AuthProvider } from "@/hooks/use-auth"
+import { AuthGuard } from "@/components/auth-guard"
+import { DashboardLayout } from "@/components/dashboard-layout"
+import { LoginPage } from "@/pages/login"
+import { BootstrapPage } from "@/pages/bootstrap"
+
+// Lazy-load all page views for code splitting
+const DashboardHome = lazy(() => import("@/pages/dashboard-home").then(m => ({ default: m.DashboardHome })))
+const EventsFeed = lazy(() => import("@/pages/events-feed").then(m => ({ default: m.EventsFeed })))
+const ApprovalsQueue = lazy(() => import("@/pages/approvals-queue").then(m => ({ default: m.ApprovalsQueue })))
+const ContractsPage = lazy(() => import("@/pages/contracts").then(m => ({ default: m.ContractsPage })))
+const AgentsPage = lazy(() => import("@/pages/agents/agents-page"))
+const AgentDetailPage = lazy(() => import("@/pages/agents/agent-detail"))
+const ApiKeysPage = lazy(() => import("@/pages/api-keys"))
+const SettingsPage = lazy(() => import("@/pages/settings"))
+
+function PageFallback() {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <Loader2 className="h-6 w-6 animate-spin text-primary" />
+    </div>
+  )
+}
+
+export function App() {
+  return (
+    <TooltipProvider>
+      <Toaster position="top-right" richColors />
+      <BrowserRouter>
+        <AuthProvider>
+        <Routes>
+          <Route path="/dashboard/login" element={<LoginPage />} />
+          <Route path="/dashboard/setup" element={<BootstrapPage />} />
+
+
+          <Route
+            path="/dashboard"
+            element={
+              <AuthGuard>
+                <DashboardLayout />
+              </AuthGuard>
+            }
+          >
+            <Route index element={<Suspense fallback={<PageFallback />}><DashboardHome /></Suspense>} />
+            <Route path="agents" element={<Suspense fallback={<PageFallback />}><AgentsPage /></Suspense>} />
+            <Route path="agents/:agentId" element={<Suspense fallback={<PageFallback />}><AgentDetailPage /></Suspense>} />
+            <Route path="events" element={<Suspense fallback={<PageFallback />}><EventsFeed /></Suspense>} />
+            <Route path="approvals" element={<Suspense fallback={<PageFallback />}><ApprovalsQueue /></Suspense>} />
+            <Route path="contracts" element={<Suspense fallback={<PageFallback />}><ContractsPage /></Suspense>} />
+            <Route path="keys" element={<Suspense fallback={<PageFallback />}><ApiKeysPage /></Suspense>} />
+            <Route path="settings" element={<Suspense fallback={<PageFallback />}><SettingsPage /></Suspense>} />
+          </Route>
+
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+        </AuthProvider>
+      </BrowserRouter>
+    </TooltipProvider>
+  )
+}

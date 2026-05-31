@@ -1,0 +1,106 @@
+"""Pydantic schemas for AI contract assistant endpoints."""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from pydantic import BaseModel, Field
+
+
+class AiConfigResponse(BaseModel):
+    """AI config returned to dashboard (API key masked, never raw)."""
+
+    provider: str
+    api_key_masked: str
+    model: str | None = None
+    base_url: str | None = None
+    configured: bool
+
+
+class UpsertAiConfigRequest(BaseModel):
+    """Request to create or update AI config."""
+
+    provider: str = Field(..., max_length=64, pattern=r"^(anthropic|openai|openrouter|ollama)$")
+    api_key: str | None = Field(None, max_length=500)
+    model: str | None = Field(None, max_length=200)
+    base_url: str | None = Field(None, max_length=500)
+
+
+class TestConnectionResponse(BaseModel):
+    """Result of testing AI provider connectivity."""
+
+    ok: bool
+    model: str | None = None
+    latency_ms: int | None = None
+    error: str | None = None
+
+
+class AssistMessage(BaseModel):
+    """A single message in the conversation."""
+
+    role: str = Field(..., pattern=r"^(user|assistant)$")
+    content: str = Field(..., max_length=10_000)
+
+
+class AssistRequest(BaseModel):
+    """Chat request for the AI contract assistant."""
+
+    messages: list[AssistMessage] = Field(..., max_length=50)
+    current_yaml: str | None = Field(None, max_length=50_000)
+
+
+class GenerateDescriptionRequest(BaseModel):
+    """Request to generate a description from contract metadata."""
+
+    name: str = Field(..., max_length=255)
+    type: str = Field(..., max_length=32)
+    definition_yaml: str = Field(..., max_length=50_000)
+    tags: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=20)
+
+
+class GenerateDescriptionResponse(BaseModel):
+    """AI-generated description for a contract."""
+
+    description: str
+
+
+class DailyUsage(BaseModel):
+    """Aggregated AI usage for a single day."""
+
+    date: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float | None
+    queries: int
+
+
+class AiUsageResponse(BaseModel):
+    """AI usage statistics over a date range."""
+
+    total_input_tokens: int
+    total_output_tokens: int
+    total_cost_usd: float | None
+    query_count: int
+    avg_tokens_per_second: float
+    daily: list[DailyUsage]
+
+
+# -- SSE event types for tool calling (documentation schemas) --
+
+
+class ToolCallStartEvent(BaseModel):
+    """SSE event emitted when the LLM invokes a tool."""
+
+    type: str = Field("tool_call_start", pattern=r"^tool_call_start$")
+    tool: str = Field(..., max_length=64)
+    id: str = Field(..., max_length=128)
+
+
+class ToolCallResultEvent(BaseModel):
+    """SSE event emitted after a tool call completes."""
+
+    type: str = Field("tool_call_result", pattern=r"^tool_call_result$")
+    id: str = Field(..., max_length=128)
+    tool: str = Field(..., max_length=64)
+    result: dict[str, object]
+    duration_ms: int

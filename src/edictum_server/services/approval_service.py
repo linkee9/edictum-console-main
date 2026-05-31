@@ -1,0 +1,209 @@
+"""Service for managing HITL approval requests."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+import sqlalchemy as sa
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import ColumnElement
+
+from edictum_server.db.models import Approval
+from edictum_server.schemas.approvals import CreateApprovalRequest
+
+
+class _ApprovalExpired(ColumnElement[bool]):
+    """DB-portable expression: created_at + timeout_seconds <= now()."""
+
+    inherit_cache = True
+    type = sa.Boolean()
+
+
+class _ApprovalNotExpired(ColumnElement[bool]):
+    """DB-portable expression: created_at + timeout_seconds > now()."""
+
+    inherit_cache = True
+    type = sa.Boolean()
+
+
+@compiles(_ApprovalExpired)
+def _compile_pg(element: Any, compiler: Any, **kw: Any) -> str:  # noqa: ARG001
+    return "approvals.created_at + (approvals.timeout_seconds * interval '1 second') <= now()"
+
+
+@compiles(_ApprovalExpired, "sqlite")
+def _compile_sqlite(element: Any, compiler: Any, **kw: Any) -> str:  # noqa: ARG001
+    return (
+        "(cast(strftime('%s', 'now') as integer)"
+        " - cast(strftime('%s', approvals.created_at) as integer))"
+        " >= approvals.timeout_seconds"
+    )
+
+
+@compiles(_ApprovalNotExpired)
+def _compile_not_expired_pg(element: Any, compiler: Any, **kw: Any) -> str:  # noqa: ARG001
+    return "approvals.created_at + (approvals.timeout_seconds * interval '1 second') > now()"
+
+
+@compiles(_ApprovalNotExpired, "sqlite")
+def _compile_not_expired_sqlite(element: Any, compiler: Any, **kw: Any) -> str:  # noqa: ARG001
+    return (
+        "(cast(strftime('%s', 'now') as integer)"
+        " - cast(strftime('%s', approvals.created_at) as integer))"
+        " < approvals.timeout_seconds"
+    )
+
+
+async def create_approval(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    request: CreateApprovalRequest,
+    *,
+    env: str = "production",
+    agent_id: str | None = None,
+) -> Approval:
+    """Create a pending approval request.
+
+    Args:
+        agent_id: Authenticated agent identity (from auth context).
+                  Takes priority over request.agent_id per CLAUDE.md rule:
+                  identity fields come from auth context, not request body.
+    """
+    approval = Approval(
+        tenant_id=tenant_id,
+        agent_id=agent_id or request.agent_id,
+        tool_name=request.tool_name,
+        tool_args=request.tool_args,
+        message=request.message,
+        status="pending",
+        env=env,
+        timeout_seconds=request.timeout,
+        timeout_effect=request.timeout_effect,
+        decision_source=request.decision_source,
+        contract_name=request.contract_name,
+    )
+    db.add(approval)
+    await db.flush()
+    return approval
+
+
+async def get_approval(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    approval_id: uuid.UUID,
+) -> Approval | None:
+    """Get a single approval by ID, scoped to tenant."""
+    result = await db.execute(
+        select(Approval).where(
+            Approval.id == approval_id,
+            Approval.tenant_id == tenant_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_pending_approvals(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+) -> list[Approval]:
+    """List all pending approvals for a tenant."""
+    result = await db.execute(
+        select(Approval)
+        .where(Approval.tenant_id == tenant_id, Approval.status == "pending")
+        .order_by(Approval.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def list_approvals(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[Approval]:
+    """List approvals for a tenant, optionally filtered by status."""
+    stmt = select(Approval).where(Approval.tenant_id == tenant_id)
+    if status:
+        stmt = stmt.where(Approval.status == status)
+    stmt = stmt.order_by(Approval.created_at.desc()).limit(limit).offset(offset)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def submit_decision(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    approval_id: uuid.UUID,
+    approved: bool,
+    decided_by: str | None = None,
+    reason: str | None = None,
+    decided_via: str | None = None,
+) -> Approval | None:
+    """Submit a human decision on a pending approval.
+
+    Uses an atomic UPDATE with status='pending' AND not-expired in the WHERE
+    clause to prevent both the TOCTOU race (concurrent decisions) and the
+    expiry race (approving after logical timeout but before worker runs).
+
+    Returns None if not found, already decided, or logically expired.
+    """
+    result = await db.execute(
+        update(Approval)
+        .where(
+            Approval.id == approval_id,
+            Approval.tenant_id == tenant_id,
+            Approval.status == "pending",
+            _ApprovalNotExpired(),
+        )
+        .values(
+            status="approved" if approved else "denied",
+            decided_by=decided_by,
+            decided_at=datetime.now(UTC),
+            decision_reason=reason,
+            decided_via=decided_via,
+        )
+        .returning(Approval)
+    )
+    approval = result.scalar_one_or_none()
+    await db.flush()
+    return approval
+
+
+async def expire_approvals(db: AsyncSession) -> list[dict[str, Any]]:
+    """Expire all pending approvals past their deadline.
+
+    Uses a single atomic UPDATE WHERE status='pending' AND expired RETURNING
+    to eliminate the TOCTOU race where concurrent expiry runs could both
+    select the same rows and emit duplicate SSE notifications.
+    """
+    result = await db.execute(
+        update(Approval)
+        .where(Approval.status == "pending")
+        .where(_ApprovalExpired())
+        .values(status="timeout", decided_via="system")
+        .returning(
+            Approval.id,
+            Approval.tenant_id,
+            Approval.env,
+            Approval.agent_id,
+            Approval.tool_name,
+        )
+    )
+    rows = result.all()
+
+    return [
+        {
+            "id": str(row.id),
+            "tenant_id": row.tenant_id,
+            "env": row.env,
+            "agent_id": row.agent_id,
+            "tool_name": row.tool_name,
+        }
+        for row in rows
+    ]
